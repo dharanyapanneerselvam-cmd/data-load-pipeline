@@ -1,17 +1,35 @@
-# Data Load Pipeline (Level 1)
+# Data Load + Transformation Pipeline
 
-Loads data from a public API into a SQLite table and verifies the row count.
+Small ELT pipeline using the JSONPlaceholder `/posts` API and SQLite.
 
-## What it does
-1. Reads posts from https://jsonplaceholder.typicode.com/posts
-2. Writes them to the `posts` table in `warehouse.db` (SQLite)
-3. Checks that source row count equals table row count
+```
+API -> load.py -> posts (raw) -> transform.py -> stg_posts (staging) -> posts_clean (final)
+```
 
 ## How to run
+```bash
 pip install -r requirements.txt
-python load.py
+python load.py        # Task 01: extract + load raw `posts` into warehouse.db
+python transform.py   # Task 02: build stg_posts and posts_clean
+```
+`transform.py` does not need internet - it only reads `warehouse.db`.
 
-## Decisions
-- SQLite: no setup needed, easy for anyone to run.
-- INSERT OR REPLACE on primary key: re-running never creates duplicates.
-- Row count check with assert: fails loudly if any rows are missing.
+## Task 01 - Extract and load
+`load.py` pulls `/posts` and writes to `posts` (id, user_id, title, body)
+using `INSERT OR REPLACE`, then checks the row count.
+
+## Task 02 - Transformation
+| Layer | Table | What happens |
+|-------|-------|--------------|
+| Raw | `posts` | Untouched copy of API data |
+| Staging | `stg_posts` | Type casting, trimming, newline cleanup, deduplication on `post_id` |
+| Final | `posts_clean` | Analyst table + `title_length`, `body_word_count` |
+
+SQL lives in `sql/` (one file per layer). `transform.py` runs them in order and validates the result.
+
+### Decisions
+- **Separate SQL files per layer** so there is no giant query; each file does one job.
+- **Dedup with `ROW_NUMBER()`** per `post_id`. Raw already has a primary key, but dedup is kept so staging stays safe if the source changes.
+- **Drop and recreate** staging/final tables each run, so re-running gives the same result.
+- **Validation** fails the script on empty output, duplicate ids, or final > raw.
+- **SQLite** used for simplicity (no setup needed).
