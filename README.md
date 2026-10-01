@@ -1,20 +1,23 @@
-# Data Load + Transformation Pipeline
+# Data Pipeline: Load, Transform, Model, Quality Gates
 
 Small ELT pipeline using the JSONPlaceholder `/posts` API and SQLite.
 
 ```
-API -> load.py -> posts (raw) -> transform.py -> stg_posts (staging) -> posts_clean (final)
+API -> load.py -> posts (raw) -> transform.py -> stg_posts -> posts_clean
+                                                                  |
+                       build_warehouse.py: build_* tables -> quality tests -> fact_posts + dim tables
 ```
 
 ## How to run
 ```bash
 pip install -r requirements.txt
-python run_pipeline.py     # load (incremental) + transform, with logging
+python run_pipeline.py     # load (incremental) + transform + model + quality gates, with logging
 ```
-Or step by step:
+Step by step:
 ```bash
-python load.py            # Task 01/03: incremental load into warehouse.db
-python transform.py       # Task 02: build stg_posts and posts_clean (no internet needed)
+python load.py             # incremental load into warehouse.db
+python transform.py        # staging + final layers (no internet needed)
+python build_warehouse.py  # dimensional model + quality gates (no internet needed)
 ```
 
 ## Task 01 - Extract and load
@@ -27,46 +30,50 @@ python transform.py       # Task 02: build stg_posts and posts_clean (no interne
 | Staging | `stg_posts` | Type casting, trimming, newline cleanup, deduplication on `post_id` |
 | Final | `posts_clean` | Analyst table + `title_length`, `body_word_count` |
 
-SQL lives in `sql/` (one file per layer). `transform.py` runs them in order and validates the result.
+SQL lives in `sql/` (one file per layer).
 
 ## Task 03 - Scheduled and idempotent
-
-### Re-running gives the same result
-- `posts.id` is a PRIMARY KEY and rows are inserted with `INSERT OR IGNORE`, so a row can never be duplicated.
-- Staging and final tables are dropped and rebuilt on every run, so they always match the raw table.
-
-### Incremental load
-- Table `load_state` keeps a **watermark** = highest post id already loaded.
-- Each run inserts only records with `id > watermark`, then moves the watermark forward.
-- Data and watermark are saved in **one transaction**: if a run fails halfway, nothing is saved and the next run retries cleanly.
-
-### Logging
-- `pipeline.log` (console + file): what each run did (fetched / inserted / skipped / total).
-- Table `run_log` in `warehouse.db`: one row per run with status, counts and error message.
-```sql
-SELECT * FROM run_log ORDER BY run_id DESC;
-```
-
-### Example
-| Run | fetched | inserted | skipped |
-|-----|---------|----------|---------|
-| 1 (empty DB) | 100 | 100 | 0 |
-| 2 (re-run) | 100 | 0 | 100 |
-| 3 (source has 5 new posts) | 105 | 5 | 100 |
-
-### Running on a schedule
-**Windows (Task Scheduler)** - runs daily at 09:00:
+- **Same result on re-run:** PRIMARY KEY + `INSERT OR IGNORE`; staging/final tables are rebuilt each run.
+- **Incremental:** `load_state` table keeps a watermark (highest id loaded); only newer rows are inserted. Data and watermark are saved in one transaction.
+- **Logging:** `pipeline.log` plus a `run_log` table (status, fetched / inserted / skipped, errors).
+- **Schedule:** `run_pipeline.bat` with Windows Task Scheduler:
 ```bat
 schtasks /create /tn "PostsPipeline" /tr "C:\full\path\to\run_pipeline.bat" /sc daily /st 09:00
 ```
-**Linux/Mac (cron)** - every day at 09:00:
+or cron: `0 9 * * * cd /path/to/repo && python run_pipeline.py`
+
+## Task 04 - Capstone: warehouse pipeline with quality gates
+
+### Dimensional model
+```mermaid
+erDiagram
+    dim_users ||--o{ fact_posts : user_key
+    dim_length_bucket ||--o{ fact_posts : length_bucket_key
+    dim_users { int user_key PK
+        int user_id
+        text user_label }
+    dim_length_bucket { int length_bucket_key PK
+        text bucket_name
+        int min_words
+        int max_words }
+    fact_posts { int post_id PK
+        int user_key FK
+        int length_bucket_key FK
+        int title_length
+        int body_word_count }
 ```
-0 9 * * * cd /path/to/data-load-pipeline && python run_pipeline.py
-```
+Details of the model and every test: [docs/model.md](docs/model.md)
+
+### Quality gates
+- The model is first built as `build_*` tables.
+- 8 tests in `quality_tests.py` run on them (not empty, row count matches, no nulls, unique keys, keys exist in dimensions, valid values).
+- **Any failed test stops the run (exit code 1)** and the published tables (`fact_posts`, `dim_users`, `dim_length_bucket`) are not touched.
+- Only if all tests pass, `build_*` tables are renamed to the published names in one transaction.
 
 ### Decisions
-- **Watermark on `id`**: the API has no `updated_at` field, and posts are append-only, so max id is the simplest reliable marker.
-- **API is still fetched in full** (the endpoint has no reliable "since" filter and it is only 100 rows), but only new rows are written to the warehouse. That is the incremental part.
-- **Existing rows are not updated** (`INSERT OR IGNORE`): posts in this API do not change. If they did, an upsert would be the next step.
-- **SQLite** used for simplicity (no setup needed).
-- Every run is logged, including failed runs.
+- **SQLite** for simplicity (no setup).
+- **Watermark on `id`:** API has no `updated_at`; posts are append-only.
+- **Build then publish:** tests run on temporary tables, so bad data never reaches the published tables.
+- **LEFT JOINs in the fact table** so a missing key becomes NULL and is caught by a test, instead of silently dropping the row.
+- **Tests are SQL queries returning bad rows:** easy to read and easy to add new ones.
+- **Static bucket dimension:** thresholds (19 / 29 words) are my own simple choice for the demo.
